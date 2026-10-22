@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<title>Song Request</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #1f2124; --surface: #2b2e33; --line: #3a3e44;
+    --text: #e4e6e8; --muted: #8a9099; --accent: #e0a84a;
+    --ok: #5cb85c; --bad: #d9534f;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 13px/1.35 system-ui, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; gap: 8px; padding: 8px;
+  }
+  button, input {
+    font: inherit; color: var(--text); background: var(--surface);
+    border: 1px solid var(--line); border-radius: 4px;
+  }
+  button { padding: 5px 10px; cursor: pointer; }
+  button:hover { background: #343841; }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  input { padding: 5px 7px; width: 100%; }
+
+  .bar { display: flex; gap: 6px; align-items: center; }
+  .bar .grow { flex: 1; }
+  #dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); flex: none; }
+  #dot.on { background: var(--ok); }
+
+  .vol { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+  .vol input[type=range] { flex: 1; padding: 0; accent-color: var(--accent); }
+  #volv { width: 2.2em; text-align: right; }
+
+  #list {
+    flex: 1; min-height: 60px; overflow-y: auto; margin: 0; padding: 0; list-style: none;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 4px;
+  }
+  #list li { display: flex; gap: 6px; align-items: baseline; padding: 5px 8px; border-bottom: 1px solid var(--line); }
+  #list li:last-child { border-bottom: 0; }
+  #list .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #list .by { color: var(--muted); font-size: 11px; flex: none; max-width: 30%; overflow: hidden; text-overflow: ellipsis; }
+  #list .x { padding: 0 5px; border: 0; background: none; color: var(--muted); }
+  #list .x:hover { color: var(--bad); }
+  #list li.now { box-shadow: inset 3px 0 var(--accent); }
+  #list li.now .t { color: var(--accent); }
+  #list li.empty { color: var(--muted); justify-content: center; padding: 14px; }
+
+  #status { color: var(--muted); font-size: 11px; min-height: 1.35em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #status.warn { color: var(--bad); white-space: normal; }
+
+  #settings { display: none; flex-direction: column; gap: 6px; background: var(--surface); border: 1px solid var(--line); border-radius: 4px; padding: 8px; }
+  #settings.open { display: flex; }
+  #settings label { display: flex; flex-direction: column; gap: 2px; color: var(--muted); font-size: 11px; }
+  #settings small { color: var(--muted); }
+
+  /* odtwarzacz YouTube: poza ekranem, bez podglądu */
+  #yt { position: fixed; left: -400px; top: 0; width: 200px; height: 200px; pointer-events: none; }
+</style>
+</head>
+<body>
+
+<div class="bar">
+  <span id="dot" title="Połączenie z czatem"></span>
+  <button id="bStart">▶ Start</button>
+  <button id="bStop">■ Stop</button>
+  <button id="bSkip">⏭ Skip</button>
+  <span class="grow"></span>
+  <button id="bCfg" title="Ustawienia">⚙</button>
+</div>
+
+<div class="vol">
+  <span>Głośność</span>
+  <input id="vol" type="range" min="0" max="100" value="30">
+  <span id="volv">30</span>
+</div>
+
+<div id="settings">
+  <label>Kanał Twitch<input id="cChannel" placeholder="nazwa_kanalu" autocomplete="off"></label>
+  <label>Komenda<input id="cCmd" placeholder="!sr" autocomplete="off"></label>
+  <label>Maks. utworów na widza w kolejce<input id="cMax" type="number" min="1" max="50"></label>
+  <label>Klucz YouTube Data API (opcjonalnie)<input id="cKey" placeholder="bez klucza działają tylko linki" autocomplete="off"></label>
+  <small>Z kluczem widzowie mogą wpisać też samą nazwę utworu.</small>
+  <button id="bSave">Zapisz</button>
+</div>
+
+<ul id="list"></ul>
+
+<div class="bar">
+  <input id="manual" placeholder="Dodaj ręcznie: link lub nazwa, Enter" autocomplete="off">
+</div>
+<div id="status"></div>
+
+<div id="yt"></div>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const load = (k, d) => { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } };
+const store = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} };
+
+let cfg = Object.assign({ channel: '', cmd: '!sr', max: 3, key: '' }, load('sr.cfg', {}));
+let queue = load('sr.queue', []);          // queue[0] = aktualny utwór
+let volume = load('sr.vol', 30);
+let player = null, ready = false, running = false, loaded = null;
+
+/* ---------- status ---------- */
+function log(msg, warn) {
+  const s = $('status'); s.textContent = msg; s.className = warn ? 'warn' : '';
+  s.title = msg;
+}
+if (location.protocol === 'file:') {
+  log('Strona otwarta z pliku – YouTube zablokuje odtwarzanie. Serwuj ją przez http(s) (patrz instrukcja).', true);
+}
+
+/* ---------- kolejka / render ---------- */
+function save() { store('sr.queue', queue); }
+function render() {
+  const ul = $('list'); ul.textContent = '';
+  if (!queue.length) {
+    const li = document.createElement('li'); li.className = 'empty'; li.textContent = 'Kolejka jest pusta';
+    ul.append(li); return;
+  }
+  queue.forEach((s, i) => {
+    const li = document.createElement('li');
+    if (i === 0 && running && loaded) li.className = 'now';
+    const t = document.createElement('span'); t.className = 't'; t.textContent = s.title; t.title = s.title;
+    const by = document.createElement('span'); by.className = 'by'; by.textContent = s.by;
+    const x = document.createElement('button'); x.className = 'x'; x.textContent = '×'; x.title = 'Usuń z kolejki';
+    x.onclick = () => remove(i);
+    li.append(t, by, x); ul.append(li);
+  });
+}
+
+/* ---------- sterowanie ---------- */
+function playHead() {
+  if (!running || !ready) return render();
+  if (!queue.length) { loaded = null; return render(); }
+  const s = queue[0];
+  if (loaded !== s.id) { loaded = s.id; player.loadVideoById(s.id); player.setVolume(volume); }
+  else player.playVideo();
+  render();
+}
+function next() {
+  if (ready) player.stopVideo();
+  queue.shift(); loaded = null; save();
+  running ? playHead() : render();
+}
+function remove(i) { if (i === 0) next(); else { queue.splice(i, 1); save(); render(); } }
+
+$('bStart').onclick = () => { running = true; playHead(); };
+$('bStop').onclick = () => { running = false; if (ready) player.pauseVideo(); render(); };
+$('bSkip').onclick = () => { if (queue.length) next(); };
+$('vol').value = volume; $('volv').textContent = volume;
+$('vol').oninput = e => {
+  volume = +e.target.value; $('volv').textContent = volume; store('sr.vol', volume);
+  if (ready) player.setVolume(volume);
+};
+
+/* ---------- YouTube ---------- */
+function onYouTubeIframeAPIReady() {
+  player = new YT.Player('yt', {
+    width: 200, height: 200,
+    playerVars: { autoplay: 1, playsinline: 1, controls: 0, origin: location.origin },
+    events: {
+      onReady: () => { ready = true; player.setVolume(volume); },
+      onStateChange: e => { if (e.data === YT.PlayerState.ENDED) next(); },
+      onError: e => {
+        if (location.protocol === 'file:') return;  // nie opróżniaj kolejki przez błąd konfiguracji
+        log('Nie można odtworzyć: ' + (queue[0] ? queue[0].title : '?') + ' (błąd ' + e.data + ')', true);
+        next();
+      }
+    }
+  });
+}
+
+function parseId(t) {
+  let m = t.match(/(?:youtu\.be\/|[?&]v=|\/shorts\/|\/embed\/)([\w-]{11})/);
+  if (m) return { id: m[1], bare: false };
+  m = t.match(/^[\w-]{11}$/);
+  return m ? { id: m[0], bare: true } : null;
+}
+async function getTitle(id) {
+  const u = encodeURIComponent('https://www.youtube.com/watch?v=' + id);
+  for (const ep of ['https://www.youtube.com/oembed?format=json&url=', 'https://noembed.com/embed?url=']) {
+    try {
+      const r = await fetch(ep + u); if (!r.ok) continue;
+      const j = await r.json(); if (j.title) return j.title;
+    } catch (e) {}
+  }
+  return null;
+}
+const decode = s => { const t = document.createElement('textarea'); t.innerHTML = s; return t.value; };
+async function search(q) {
+  const url = 'https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoEmbeddable=true&maxResults=1&q='
+    + encodeURIComponent(q) + '&key=' + encodeURIComponent(cfg.key);
+  const r = await fetch(url); const j = await r.json();
+  if (j.error) throw new Error(j.error.message);
+  const it = j.items && j.items[0];
+  return it ? { id: it.id.videoId, title: decode(it.snippet.title) } : null;
+}
+
+/* ---------- zamówienia ---------- */
+async function request(nick, arg) {
+  arg = arg.trim(); if (!arg) return;
+  if (nick !== 'ty' && queue.filter(s => s.by === nick).length >= cfg.max)
+    return log(nick + ': limit ' + cfg.max + ' utw. w kolejce osiągnięty');
+  let id = null, title = null;
+  const p = parseId(arg);
+  if (p) { id = p.id; title = await getTitle(id); if (!title && !p.bare) return log(nick + ': film niedostępny lub nie do osadzenia', true); }
+  if (!title) {
+    if (!cfg.key) return log(nick + ': wyszukiwanie po nazwie wymaga klucza API – tylko linki', true);
+    try {
+      const r = await search(arg);
+      if (!r) return log(nick + ': nic nie znaleziono dla „' + arg + '”');
+      id = r.id; title = r.title;
+    } catch (e) { return log('Błąd wyszukiwania: ' + e.message, true); }
+  }
+  if (queue.some(s => s.id === id)) return log(nick + ': „' + title + '” już jest w kolejce');
+  queue.push({ id, title, by: nick }); save();
+  log('+ ' + title + ' (' + nick + ')');
+  if (running && queue.length === 1) playHead(); else render();
+}
+$('manual').onkeydown = e => {
+  if (e.key === 'Enter' && e.target.value.trim()) { request('ty', e.target.value); e.target.value = ''; }
+};
+
+/* ---------- czat Twitch (anonimowy odczyt, bez logowania) ---------- */
+let ws = null, retry = null;
+function connect() {
+  clearTimeout(retry);
+  if (ws) { ws.onclose = null; try { ws.close(); } catch (e) {} ws = null; }
+  $('dot').className = '';
+  if (!cfg.channel) return;
+  ws = new WebSocket('wss://irc-ws.chat.twitch.tv:443');
+  ws.onopen = () => {
+    ws.send('CAP REQ :twitch.tv/tags');
+    ws.send('NICK justinfan' + (1000 + Math.floor(Math.random() * 80000)));
+    ws.send('JOIN #' + cfg.channel);
+  };
+  ws.onmessage = e => e.data.split('\r\n').forEach(handle);
+  ws.onclose = () => { $('dot').className = ''; retry = setTimeout(connect, 5000); };
+}
+function handle(line) {
+  if (!line) return;
+  if (line.startsWith('PING')) return ws.send('PONG :tmi.twitch.tv');
+  if (line.includes(' JOIN #')) { $('dot').className = 'on'; return; }
+  const m = line.match(/^(?:@(\S+) )?:(\w+)!\w+@\w+\.tmi\.twitch\.tv PRIVMSG #\w+ :(.*)$/);
+  if (!m) return;
+  const tags = {};
+  (m[1] || '').split(';').forEach(kv => { const i = kv.indexOf('='); if (i > 0) tags[kv.slice(0, i)] = kv.slice(i + 1); });
+  const nick = tags['display-name'] || m[2];
+  const text = m[3].replace(/[\u{E0000}\u200B]/gu, '').trim();
+  const cmd = cfg.cmd.toLowerCase();
+  if (text.toLowerCase().startsWith(cmd + ' ')) request(nick, text.slice(cmd.length));
+}
+
+/* ---------- ustawienia ---------- */
+function fillCfg() { $('cChannel').value = cfg.channel; $('cCmd').value = cfg.cmd; $('cMax').value = cfg.max; $('cKey').value = cfg.key; }
+$('bCfg').onclick = () => $('settings').classList.toggle('open');
+$('bSave').onclick = () => {
+  cfg = {
+    channel: $('cChannel').value.trim().replace(/^#/, '').toLowerCase(),
+    cmd: ($('cCmd').value.trim() || '!sr'),
+    max: Math.max(1, +$('cMax').value || 3),
+    key: $('cKey').value.trim()
+  };
+  store('sr.cfg', cfg); $('settings').classList.remove('open'); connect();
+  log(cfg.channel ? 'Zapisano. Łączenie z #' + cfg.channel + '…' : 'Podaj nazwę kanału.');
+};
+
+/* ---------- start ---------- */
+fillCfg(); render();
+if (!cfg.channel) $('settings').classList.add('open'); else connect();
+const tag = document.createElement('script');
+tag.src = 'https://www.youtube.com/iframe_api';
+document.head.append(tag);
+</script>
+</body>
+</html>
